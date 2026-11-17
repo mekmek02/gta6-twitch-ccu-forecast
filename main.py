@@ -1,32 +1,53 @@
 """gta6-twitch-ccu-forecast-01 entry in Python 3.13 (standard library only).
 
-Model: empirical launch-day quantiles.
-  A big console launch's Twitch day follows a diurnal shape driven by the
-  midnight-local unlock rolling around the world: hour 1 (00:00-01:00 UTC)
-  already holds the UK midnight crowd plus New Zealand and Europe, the
-  early UTC morning sags, and the count climbs into the US evening peak.
-  Instead of assuming that shape, this program measures it from the case's
-  own `comparables` -- 38 past big launches in a practice case, all 42 in
-  the final -- each reduced to one number per hour: log(viewers_h /
-  viewers_hour1). For every hour h = 2..24 and every scored level tau, the
-  forecast is hour-1's print times exp(the tau-quantile of that hour's
-  log-ratios across all usable comparables), lightly smoothed across
-  neighbouring hours. The quantiles are the exact quantities pinball loss
-  rewards, so the forecast is calibrated by construction rather than by a
-  guessed spread.
+Model v2: scale-aware empirical launch-day quantiles.
+  A big console launch's Twitch day follows a diurnal shape driven by
+  the midnight-local unlock rolling around the world: hour 1 (00:00-01:00
+  UTC) already holds the UK midnight crowd plus New Zealand and Europe,
+  the early UTC morning sags, and the count climbs into the US evening
+  peak. But the SHAPE depends strongly on the launch's size: the
+  biggest launches (hour 1 ~300-875k) peak at only ~1.0-1.3x hour 1,
+  while small launches (hour 1 < 1k) explode to 5-8x by hour 19. The
+  submitted v1 model pooled all 38 comparables equally, so its median
+  sat at ~2.4x by hour 19 and its 95th quantile at ~350x -- fine for a
+  mid-size launch, but it LOSES to the house baseline on big launches
+  (leave-one-out 0.361 vs baseline 0.251) and is badly miscalibrated
+  for a mega launch like GTA VI, whose hour-1 print will dwarf every
+  comparable (max 875k).
 
-  Why this beats the house baseline (flat hour-1 print, spread
-  0.15*sqrt(h-1)): the baseline's median is wrong in a predictable way --
-  it misses both the morning sag (median ratio ~0.55x at hours 10-11) and
-  the US-evening peak (median ratio ~1.3x at hours 20-21, and up to ~9x on
-  the biggest single-player launches) -- while its spread is far too
-  narrow late in the day (cross-launch std of the log-ratio is ~0.4, not
-  the baseline's implied ~0.15*sqrt(h-1) shape around a wrong centre).
-  Measured on the four practice cases (answers from SullyGnome, the same
-  source the cases use): this model scores mean pinball loss 0.315-0.325
-  against the baseline's 0.387, and wins on 3 of the 4 cases outright.
-  Leave-one-out over the 38 comparables gives the same picture
-  (0.71 vs 0.93 on all launches, 0.21 vs 0.25 on the big hour-1 ones).
+  v2 fixes that by making the forecast conditional on hour-1 size,
+  with two local estimators in log(hour-1) space, both centred on the
+  case's own hour-1 print:
+    * centre: a kernel-weighted local-linear fit (Gaussian kernel,
+      sigma 1.5 log units) of each hour's log-ratio on log(hour-1),
+      evaluated at the case's log(hour-1) CLAMPED to the observed
+      range -- no extrapolation past the biggest comparable. The
+      scale trend is real but must saturate: the biggest observed
+      launches peak at 0.95-1.31x, and extrapolating the fitted slope
+      past them would push the median below every big launch seen.
+    * spread: Gaussian-kernel weighted quantiles (sigma 1.0) of the
+      same hour's log-ratios, re-centred on the local-linear centre.
+      The kernel gives ~zero weight to launches far in scale, so a
+      mega launch is forecast from the biggest launches only, while a
+      small launch is forecast from the small ones.
+  The result is lightly smoothed across neighbouring hours, rounded
+  half-up to 2 decimals (the starter's rounding), clamped to (0, 1e9]
+  with monotonicity repaired per row.
+
+  Measured (local harness, test_local.py + work/exp_v2..v5.py):
+    practice mean (4 SullyGnome cases): 0.206 vs v1 0.325 vs baseline
+      0.387 -- wins on all four cases individually (0.221 / 0.260 /
+      0.148 / 0.197 vs v1's 0.405 / 0.289 / 0.288 / 0.317).
+    leave-one-out over the 38 comparables: 0.386 vs v1 0.713 vs
+      baseline 0.930; on big launches (hour-1 >= 50k): 0.204 vs v1
+      0.361 vs baseline 0.251; on mega launches (>= 150k): 0.200 vs
+      v1 0.408 vs baseline 0.253. The scale-aware model is the first
+      version that beats the baseline on big launches at all.
+    mega-launch sanity (hour-1 = 2,000,000, p00's comparables):
+      median ratio 0.93x at hour 19, 0.89x at hour 21; 95th 1.35x /
+      1.50x; 5th 0.83x / 0.84x -- inside the observed big-launch
+      range (median 1.31x, 5th 0.84x, 95th 2.60x at hour 19), where
+      v1 forecast 2.23x median and a 352x 95th.
 
 How the grader runs it: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0)
 in python:3.13-slim, standard library only: no network, no pip packages.
@@ -76,6 +97,14 @@ MIN_COMPARABLES = 5
 BASELINE_SIGMA = 0.15
 # Standard normal quantile at each scored level.
 Z_BY_LEVEL = {0.05: -1.645, 0.25: -0.674, 0.5: 0.0, 0.75: 0.674, 0.95: 1.645}
+# Gaussian kernel bandwidths in log(hour-1) units. The centre uses a
+# wider kernel (a smooth trend needs more data); the spread uses a
+# narrower one (the conditional distribution changes fast with scale).
+# Both optima are flat (sigma 0.75-1.25 for the spread and 1.0-1.5 for
+# the centre score within 0.005 of each other on leave-one-out), so
+# these are not knife-edge tunings.
+CENTRE_SIGMA = 1.5
+SPREAD_SIGMA = 1.0
 
 
 def round2(x):
@@ -104,6 +133,70 @@ def empirical_quantile(sorted_values, tau):
     hi = lo + 1 if lo + 1 < n else lo
     frac = pos - lo
     return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac
+
+
+def weighted_quantile(pairs, tau):
+    """Weighted type-7 quantile of (value, weight) pairs.
+
+    The pairs are sorted by value; the target is tau * total weight,
+    linearly interpolated between the bracketing order statistics.
+    Deterministic: sorting is stable and the input order is fixed.
+    """
+    if not pairs:
+        return 0.0
+    pairs = sorted(pairs)
+    total = sum(w for _, w in pairs)
+    if total <= 0:
+        return empirical_quantile([v for v, _ in pairs], tau)
+    target = tau * total
+    acc = 0.0
+    prev_v, prev_cum = pairs[0][0], 0.0
+    for v, w in pairs:
+        acc += w
+        if acc >= target:
+            if w <= 0:
+                return v
+            frac = (target - prev_cum) / w
+            return prev_v + frac * (v - prev_v)
+        prev_v, prev_cum = v, acc
+    return pairs[-1][0]
+
+
+def kernel_weight(log_h1, log_p1, sigma):
+    """Gaussian kernel weight of a comparable at log(hour-1)."""
+    d = (log_h1 - log_p1) / sigma
+    return math.exp(-0.5 * d * d)
+
+
+def local_linear_centre(points, log_p1, sigma):
+    """Kernel-weighted local-linear fit of log-ratio on log(hour-1),
+    evaluated at log_p1 clamped to the observed log(hour-1) range.
+
+    points: list of (log-ratio, log-hour-1). The clamp is the whole
+    point for a mega launch: the scale trend is real inside the data
+    but must saturate -- extrapolating the fitted slope past the
+    biggest comparable would push the forecast below every big launch
+    ever seen. With the clamp, a launch bigger than all comparables
+    is forecast like the biggest ones, which is the honest prior.
+    """
+    if not points:
+        return 0.0
+    weights = [kernel_weight(x, log_p1, sigma) for _, x in points]
+    sw = sum(weights)
+    if sw <= 0:
+        return sum(y for y, _ in points) / len(points)
+    mx = sum(w * x for w, (_, x) in zip(weights, points)) / sw
+    my = sum(w * y for w, (y, _) in zip(weights, points)) / sw
+    var = sum(w * (x - mx) ** 2 for w, (_, x) in zip(weights, points))
+    if var <= 1e-12:
+        return my
+    cov = sum(w * (x - mx) * (y - my)
+              for w, (y, x) in zip(weights, points))
+    slope = cov / var
+    intercept = my - slope * mx
+    xs = [x for _, x in points]
+    x_pred = min(max(log_p1, min(xs)), max(xs))
+    return intercept + slope * x_pred
 
 
 def smooth_across_hours(values_by_hour, hours):
@@ -156,7 +249,7 @@ def usable_comparables(case):
 
 
 def hour_quantiles(case, p1, hours, levels):
-    """Log-quantile offsets per hour, from the comparables' log-ratios.
+    """Log-quantile offsets per hour, conditional on hour-1 size.
 
     Returns {hour: [log offset at each level]} so the caller anchors
     them on hour 1's print. Falls back to the house baseline shape
@@ -171,20 +264,30 @@ def hour_quantiles(case, p1, hours, levels):
                 for tau in levels
             ]
         return offsets
-    names = sorted(curves)
-    # log-ratio of each hour to hour 1, per comparable, per hour.
-    ratios = {h: [] for h in hours}
-    for name in names:
-        curve = curves[name]
-        base = math.log(curve[1])
-        for h in hours:
-            if h in curve:
-                ratios[h].append(math.log(curve[h]) - base)
-    # Empirical quantile of the log-ratios at each scored level.
+    log_p1 = math.log(p1)
     raw = {}
     for h in hours:
-        ordered = sorted(ratios[h])
-        raw[h] = [empirical_quantile(ordered, tau) for tau in levels]
+        # (log-ratio to hour 1, log hour-1) for every comparable that
+        # has this hour.
+        points = []
+        for curve in curves.values():
+            if h in curve:
+                points.append((math.log(curve[h] / curve[1]),
+                               math.log(curve[1])))
+        if len(points) < MIN_COMPARABLES:
+            # Too thin for the local fit: plain empirical quantiles.
+            ordered = sorted(y for y, _ in points)
+            raw[h] = [empirical_quantile(ordered, tau) for tau in levels]
+            continue
+        # Centre: local-linear trend at this case's scale (clamped).
+        centre = local_linear_centre(points, log_p1, CENTRE_SIGMA)
+        # Spread: kernel-weighted quantiles of the same log-ratios,
+        # re-centred on the local-linear centre.
+        pairs = [(y, kernel_weight(x, log_p1, SPREAD_SIGMA))
+                 for y, x in points]
+        spread = [weighted_quantile(pairs, tau) for tau in levels]
+        median = weighted_quantile(pairs, 0.5)
+        raw[h] = [centre + (q - median) for q in spread]
     # Smooth each level's curve across neighbouring hours.
     for i in range(len(levels)):
         smoothed = smooth_across_hours(
