@@ -1,5 +1,12 @@
 """gta6-twitch-ccu-forecast-01 entry in Python 3.13 (standard library only).
 
+Model v3 (v2 + 5-point smoothing + SPREAD_SIGMA 0.85):
+  practice mean 0.1909 (v2 0.1918), LOO-all 0.3984 (v2 0.4009),
+  LOO-big 0.2069 (v2 0.2076), LOO-mega 0.2035 (v2 0.2040).
+  Marginal gains (paired LOO t=-0.78, not significant) but every
+  measured aggregate moves the right way and the mega-case profile
+  stays sane (h19 0.93x/0.82x/1.27x).
+
 Model v2: scale-aware empirical launch-day quantiles.
   A big console launch's Twitch day follows a diurnal shape driven by
   the midnight-local unlock rolling around the world: hour 1 (00:00-01:00
@@ -104,7 +111,7 @@ Z_BY_LEVEL = {0.05: -1.645, 0.25: -0.674, 0.5: 0.0, 0.75: 0.674, 0.95: 1.645}
 # the centre score within 0.005 of each other on leave-one-out), so
 # these are not knife-edge tunings.
 CENTRE_SIGMA = 1.5
-SPREAD_SIGMA = 1.0
+SPREAD_SIGMA = 0.85
 
 
 def round2(x):
@@ -200,20 +207,23 @@ def local_linear_centre(points, log_p1, sigma):
 
 
 def smooth_across_hours(values_by_hour, hours):
-    """3-point moving average of one quantile level across hours.
+    """5-point moving average of one quantile level across hours.
 
-    At the ends the missing neighbour is replaced by the hour's own
-    value, so the ends move two-thirds of the way toward their single
-    neighbour instead of staying put.
+    v3: the 3-point window was replaced by a 5-point window after
+    exp_v6/v6b showed it wins on both practice mean and leave-one-out
+    (with SPREAD_SIGMA 0.85). At the ends the missing neighbours are
+    replaced by the hour's own value.
     """
     out = {}
     for h in hours:
         neighbours = [
+            values_by_hour.get(h - 2, values_by_hour[h]),
             values_by_hour.get(h - 1, values_by_hour[h]),
             values_by_hour[h],
             values_by_hour.get(h + 1, values_by_hour[h]),
+            values_by_hour.get(h + 2, values_by_hour[h]),
         ]
-        out[h] = sum(neighbours) / 3.0
+        out[h] = sum(neighbours) / 5.0
     return out
 
 
